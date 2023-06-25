@@ -38,13 +38,15 @@ class Detect(nn.Module):
         self.cv2 = nn.ModuleList(
             nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch)
         self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+        self.atte = nn.ModuleList(GAM_Attention(x, x) for x in ch)
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
         shape = x[0].shape  # BCHW
         for i in range(self.nl):
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            #x[i] = self.m[i](self.atte[i](x[i]))  # conv
+            x[i] = torch.cat((self.cv2[i](self.atte[i](x[i])), self.cv3[i](self.atte[i](x[i]))), 1)
         if self.training:
             return x
         elif self.dynamic or self.shape != shape:
@@ -70,6 +72,66 @@ class Detect(nn.Module):
             a[-1].bias.data[:] = 1.0  # box
             b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
 
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+
+    def forward(self, x):
+        return x * self.sigmoid(x)  
+
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+def channel_shuffle(x, groups=2):   ##shuffle channel 
+    #RESHAPE----->transpose------->Flatten 
+    B, C, H, W = x.size()
+    out = x.view(B, groups, C // groups, H, W).permute(0, 2, 1, 3, 4).contiguous()
+    out=out.view(B, C, H, W) 
+    return out
+
+#############################################
+# GAM
+#############################################
+class GAM_Attention(nn.Module):  
+    def __init__(self, in_channels, out_channels, rate=4):  
+        super(GAM_Attention, self).__init__()  
+
+        self.channel_attention = nn.Sequential(  
+            nn.Linear(in_channels, int(in_channels / rate)),  
+            h_swish(),  
+            nn.Linear(int(in_channels / rate), in_channels)  
+        )  
+      
+        self.spatial_attention = nn.Sequential(  
+            nn.Conv2d(in_channels, int(in_channels / rate), kernel_size=7, padding=3),  
+            nn.BatchNorm2d(int(in_channels / rate)),  
+            h_swish(),  
+            nn.Conv2d(int(in_channels / rate), out_channels, kernel_size=7, padding=3),  
+            nn.BatchNorm2d(out_channels)  
+        )  
+
+        #self.dsilu = DSiLu()
+      
+    def forward(self, x):  
+      b, c, h, w = x.shape  
+      x_permute = x.permute(0, 2, 3, 1).view(b, -1, c)  
+      #x_permute=channel_shuffle(x_permute,4) #last shuffle
+      x_att_permute = self.channel_attention(x_permute).view(b, h, w, c)  
+      x_channel_att = x_att_permute.permute(0, 3, 1, 2)  
+      #x_channel_att=channel_shuffle(x_channel_att,4) #last shuffle
+      x = x * x_channel_att  
+      #x=channel_shuffle(x,4)
+      x_spatial_att = self.spatial_attention(x).sigmoid()
+      #x_spatial_att=channel_shuffle(x_spatial_att,4) #last shuffle
+      out = x * x_spatial_att  
+      out=channel_shuffle(out,4) #last shuffle 
+      return out
 
 class Segment(Detect):
     """YOLOv8 Segment head for segmentation models."""
